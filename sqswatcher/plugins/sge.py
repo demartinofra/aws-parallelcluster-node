@@ -12,7 +12,6 @@ import collections
 import logging
 import os
 import re
-
 import socket
 import subprocess
 import time
@@ -40,7 +39,9 @@ def _is_host_configured(command, hostname):
 def _add_hosts_by_type(hostnames, host_type_config):
     try:
         log.info("Adding hosts %s as %s host", ",".join(hostnames), host_type_config.host_type)
-        command = "qconf {flags} {hostnames}".format(flags=host_type_config.command_flags, hostnames=",".join(hostnames))
+        command = "qconf {flags} {hostnames}".format(
+            flags=host_type_config.command_flags, hostnames=",".join(hostnames)
+        )
         output = check_sge_command_output(command, raise_on_error=False)
         failed_hosts = succeeded_hosts = []
         log.info(output)
@@ -52,22 +53,26 @@ def _add_hosts_by_type(hostnames, host_type_config):
 
         return succeeded_hosts, failed_hosts
     except Exception as e:
-        log.error("Unable to add hosts %s as %s host. Failed with exception %s", ",".join(hostnames),
-                  host_type_config.host_type, e)
+        log.error(
+            "Unable to add hosts %s as %s host. Failed with exception %s",
+            ",".join(hostnames),
+            host_type_config.host_type,
+            e,
+        )
         return [], hostnames
 
 
 HOST_TYPE_TO_CONFIG_MAP = {
     "ADMINISTRATIVE": SGEHostTypeConfig(
         command_flags="-ah",
-        successful_messages=[r'.* added to administrative host list', r'adminhost ".*" already exists'],
+        successful_messages=[r".* added to administrative host list", r'adminhost ".*" already exists'],
         host_type="administrative",
     ),
     "SUBMIT": SGEHostTypeConfig(
         command_flags="-as",
-        successful_messages=[r'.* added to submit host list', r'submithost ".*" already exists'],
+        successful_messages=[r".* added to submit host list", r'submithost ".*" already exists'],
         host_type="submit",
-    )
+    ),
 }
 
 
