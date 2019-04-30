@@ -11,6 +11,8 @@
 import collections
 import logging
 import os
+import re
+
 import socket
 import subprocess
 import time
@@ -39,12 +41,11 @@ def _add_hosts_by_type(hostnames, host_type_config):
     try:
         log.info("Adding hosts %s as %s host", ",".join(hostnames), host_type_config.host_type)
         command = "qconf {flags} {hostnames}".format(flags=host_type_config.command_flags, hostnames=",".join(hostnames))
-        output = check_sge_command_output(command)
+        output = check_sge_command_output(command, raise_on_error=False)
         failed_hosts = succeeded_hosts = []
         log.info(output)
-        for hostname in hostnames:
-            successful_messages = [message.format(hostname=hostname) for message in host_type_config.successful_messages]
-            if any(message in output for message in successful_messages):
+        for hostname, message in zip(hostnames, output.split("\n")):
+            if any(re.match(pattern, message) is not None for pattern in host_type_config.successful_messages):
                 succeeded_hosts.append(hostname)
             else:
                 failed_hosts.append(hostname)
@@ -59,12 +60,12 @@ def _add_hosts_by_type(hostnames, host_type_config):
 HOST_TYPE_TO_CONFIG_MAP = {
     "ADMINISTRATIVE": SGEHostTypeConfig(
         command_flags="-ah",
-        successful_messages=['"{hostname}" added to administrative host list', 'adminhost "{hostname}" already exists'],
+        successful_messages=[r'.* added to administrative host list', r'adminhost ".*" already exists'],
         host_type="administrative",
     ),
     "SUBMIT": SGEHostTypeConfig(
         command_flags="-as",
-        successful_messages=['"{hostname}" added to submit host list', 'submithost "{hostname}" already exists'],
+        successful_messages=[r'.* added to submit host list', r'submithost ".*" already exists'],
         host_type="submit",
     )
 }
