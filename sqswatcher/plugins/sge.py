@@ -8,7 +8,7 @@
 # or in the "LICENSE.txt" file accompanying this file. This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES
 # OR CONDITIONS OF ANY KIND, express or implied. See the License for the specific language governing permissions and
 # limitations under the License.
-
+import collections
 import logging
 import os
 import socket
@@ -23,6 +23,8 @@ from common.sge import check_sge_command_output, run_sge_command
 
 log = logging.getLogger(__name__)
 
+SGEHostTypeConfig = collections.namedtuple("SGEHostTypeConfig", ["command_flags", "successful_messages", "host_type"])
+
 
 def _is_host_configured(command, hostname):
     output = check_sge_command_output(command)
@@ -31,6 +33,73 @@ def _is_host_configured(command, hostname):
     # ip-172-31-74-69.ec2.internal
     match = list(filter(lambda x: hostname in x.split(".")[0], output.split("\n")))
     return True if len(match) > 0 else False
+
+
+def _add_hosts_by_type(hostnames, host_type_config):
+    try:
+        log.info("Adding hosts %s as %s host", ",".join(hostnames), host_type_config.host_type)
+        command = "qconf {flags} {hostnames}".format(flags=host_type_config.command_flags, hostnames=",".join(hostnames))
+        output = check_sge_command_output(command)
+        failed_hosts = succeeded_hosts = []
+        log.info(output)
+        for hostname in hostnames:
+            successful_messages = [message.format(hostname=hostname) for message in host_type_config.successful_messages]
+            if any(message in output for message in successful_messages):
+                succeeded_hosts.append(hostname)
+            else:
+                failed_hosts.append(hostname)
+
+        return succeeded_hosts, failed_hosts
+    except Exception as e:
+        log.error("Unable to add hosts %s as %s host. Failed with exception %s", ",".join(hostnames),
+                  host_type_config.host_type, e)
+        return [], hostnames
+
+
+HOST_TYPE_TO_CONFIG_MAP = {
+    "ADMINISTRATIVE": SGEHostTypeConfig(
+        command_flags="-ah",
+        successful_messages=['"{hostname}" added to administrative host list', 'adminhost "{hostname}" already exists'],
+        host_type="administrative",
+    ),
+    "SUBMIT": SGEHostTypeConfig(
+        command_flags="-as",
+        successful_messages=['"{hostname}" added to submit host list', 'submithost "{hostname}" already exists'],
+        host_type="submit",
+    )
+}
+
+
+def _add_hosts(hosts):
+    hostnames = [host.hostname for host in hosts]
+    for host_type in ["ADMINISTRATIVE", "SUBMIT"]:
+        succeeded_hosts, failed_hosts = _add_hosts_by_type(hostnames, HOST_TYPE_TO_CONFIG_MAP[host_type])
+        if failed_hosts:
+            return succeeded_hosts, failed_hosts
+
+    failed_hosts = succeeded_hosts = []
+    for host in hosts:
+        # Add the host to the all.q
+        try:
+            command = "qconf -aattr hostgroup hostlist %s @allhosts" % host.hostname
+            run_sge_command(command)
+        except Exception as e:
+            log.warning("Unable to add host %s to all.q. Failed with exception %s", host.hostname, e)
+            failed_hosts.append(host.hostname)
+            continue
+
+        # Set the numbers of slots for the host
+        try:
+            command = 'qconf -aattr queue slots ["%s=%s"] all.q' % (host.hostname, host.slots)
+            run_sge_command(command)
+        except Exception as e:
+            log.warning("Unable to set the number of slots for the host %s. Failed with exception %s", host.hostname, e)
+            failed_hosts.append(host.hostname)
+            continue
+
+        succeeded_hosts.append(host.hostname)
+
+    return failed_hosts, succeeded_hosts
 
 
 def addHost(hostname, cluster_user, slots, max_cluster_size):
@@ -173,17 +242,29 @@ def removeHost(hostname, cluster_user, max_cluster_size):
 def update_cluster(max_cluster_size, cluster_user, update_events, instance_properties):
     failed = []
     succeeded = []
+    hosts_to_add = []
     for event in update_events:
         try:
             if event.action == "REMOVE":
                 removeHost(event.host.hostname, cluster_user, max_cluster_size)
             elif event.action == "ADD":
-                addHost(event.host.hostname, cluster_user, event.host.slots, max_cluster_size)
+                # addHost(event.host.hostname, cluster_user, event.host.slots, max_cluster_size)
+                hosts_to_add.append(event.host)
+                continue
             succeeded.append(event)
         except Exception as e:
             log.error(
                 "Encountered error when processing %s event for host %s: %s", event.action, event.host.hostname, e
             )
             failed.append(event)
+
+    if hosts_to_add:
+        failed_hosts, succeeded_hosts = _add_hosts(hosts_to_add)
+        for event in update_events:
+            if event.action == "ADD":
+                if event.host.hostname in failed_hosts:
+                    failed.append(event)
+                else:
+                    succeeded.append(event)
 
     return failed, succeeded
