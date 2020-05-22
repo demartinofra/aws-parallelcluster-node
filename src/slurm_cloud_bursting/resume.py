@@ -1,6 +1,5 @@
-#!/usr/local/pyenv/versions/node_virtualenv/bin/python
-
 import collections
+import json
 import logging
 import shlex
 import subprocess
@@ -9,11 +8,12 @@ import argparse
 import boto3
 
 REGION = "us-east-2"
-CLUSTER_NAME = "hit-integration-5"
+CLUSTER_NAME = "hit"
 TAG_SPECIFICATIONS = [{"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": "cloud-bursting-compute",}]}]
 
 SCONTROL = "/opt/slurm/bin/scontrol"
 LOGFILE = "/home/slurm/slurm_resume.log"
+QUEUES_CONFIG = "/opt/parallelcluster/configs/slurm_config.json"
 INSTANCES_BATCH_SIZE = 10
 
 # Set to True if the nodes aren't accessible by dns.
@@ -64,7 +64,7 @@ def _parse_ec2_instance(instance):
     )
 
 
-def add_instances(node_list):
+def add_instances(node_list, queues_config):
     ec2_client = boto3.client("ec2", region_name=REGION)
 
     instances_to_launch = collections.defaultdict(lambda: collections.defaultdict(list))
@@ -79,12 +79,25 @@ def add_instances(node_list):
             total = len(instances_list)
             while total > 0:
                 batch_count = min(total, INSTANCES_BATCH_SIZE)
+                run_instances_args = {}
+                if queues_config[queue].get("disable_hyperthreading", False):
+                    core_count = next(
+                        (
+                            instance["vcpus"]
+                            for instance in queues_config[queue]["instances"]
+                            if instance["type"] == instance_type
+                        )
+                    )
+                    run_instances_args["CpuOptions"] = {"CoreCount": core_count, "ThreadsPerCore": 1}
+                # TODO add spot_price to run_instances_args
+
                 result = ec2_client.run_instances(
                     LaunchTemplate={"LaunchTemplateName": CLUSTER_NAME + "-" + queue},
                     MinCount=batch_count,
                     MaxCount=batch_count,
                     InstanceType=instance_type,
                     TagSpecifications=TAG_SPECIFICATIONS,
+                    **run_instances_args
                 )
                 launched_instances.extend(
                     [
@@ -98,7 +111,7 @@ def add_instances(node_list):
         update_slurm_node_addrs(launched_instances)
 
 
-def main(arg_nodes):
+def resume(arg_nodes):
     logging.debug("Bursting out:" + arg_nodes)
 
     # Get node list
@@ -106,9 +119,12 @@ def main(arg_nodes):
     nodes_str = run_command(show_hostname_cmd).stdout
     node_list = nodes_str.splitlines()
 
+    with open(QUEUES_CONFIG) as f:
+        queues_config = json.load(f)["queues_config"]
+
     retry_list = []
     while True:
-        add_instances(node_list)
+        add_instances(node_list, queues_config)
         if not len(retry_list):
             break
 
@@ -119,8 +135,8 @@ def main(arg_nodes):
     logging.debug("done adding instances")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,)
+def main():
+    parser = argparse.ArgumentParser()
     parser.add_argument("nodes", help="Nodes to burst")
 
     args = parser.parse_args()
@@ -132,6 +148,10 @@ if __name__ == "__main__":
     logging.basicConfig(filename=LOGFILE, format="%(asctime)s %(name)s %(levelname)s: %(message)s", level=logging.DEBUG)
 
     try:
-        main(args.nodes)
+        resume(args.nodes)
     except Exception as e:
         logging.exception(e)
+
+
+if __name__ == "__main__":
+    main()

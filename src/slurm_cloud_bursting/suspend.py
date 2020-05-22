@@ -1,4 +1,3 @@
-#!/usr/local/pyenv/versions/node_virtualenv/bin/python
 import collections
 import itertools
 import logging
@@ -98,7 +97,7 @@ def _resume_nodes(nodes):
     _run_command(resume_nodes_command, fail_on_error=False)
 
 
-def main(arg_nodes):
+def suspend(arg_nodes):
     logging.debug("deleting nodes:" + arg_nodes)
 
     slurm_nodes = _get_nodes_info(arg_nodes)
@@ -123,8 +122,8 @@ def main(arg_nodes):
     logging.debug("done deleting instances")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def main():
+    parser = argparse.ArgumentParser()
     parser.add_argument("nodes", help="Nodes to release")
 
     args = parser.parse_args()
@@ -136,6 +135,10 @@ if __name__ == "__main__":
     logging.basicConfig(filename=LOGFILE, format="%(asctime)s %(name)s %(levelname)s: %(message)s", level=logging.DEBUG)
 
     try:
-        main(args.nodes)
+        suspend(args.nodes)
     except Exception as e:
         logging.exception(e)
+
+
+if __name__ == "__main__":
+    main()
