@@ -42,6 +42,7 @@ def boto3_stubber_path():
                 "logging_config": os.path.join(
                     os.path.dirname(slurm_plugin.__file__), "logging", "parallelcluster_clustermgtd_logging.conf"
                 ),
+                "dynamodb_table": "table-name",
                 # launch configs
                 "update_node_address": True,
                 "launch_max_batch_size": 100,
@@ -72,6 +73,7 @@ def boto3_stubber_path():
                 "disable_all_cluster_management": True,
                 "heartbeat_file_path": "/home/ubuntu/clustermgtd_heartbeat",
                 "logging_config": "/my/logging/config",
+                "dynamodb_table": "table-name",
                 # launch configs
                 "update_node_address": False,
                 "launch_max_batch_size": 1,
@@ -102,6 +104,7 @@ def boto3_stubber_path():
                 "disable_all_cluster_management": True,
                 "heartbeat_file_path": "/home/ubuntu/clustermgtd_heartbeat",
                 "logging_config": "/my/logging/config",
+                "dynamodb_table": "table-name",
                 # launch configs
                 "update_node_address": False,
                 "launch_max_batch_size": 1,
@@ -128,16 +131,16 @@ def test_clustermgtd_config(config_file, expected_attributes, test_datadir):
 
 
 @pytest.mark.parametrize("initialize_instance_manager", [(False,), (True,)])
-def test_set_sync_config(initialize_instance_manager, mocker):
+def test_set_config(initialize_instance_manager, mocker, initialize_instance_manager_mock, initialize_compute_fleet_status_manager_mock):
     sync_config = SimpleNamespace(some_key_1="some_value_1", some_key_2="some_value_2")
-    cluster_manager = ClusterManager()
-    cluster_manager._initialize_instance_manager = mocker.MagicMock()
-    cluster_manager._set_sync_config(sync_config)
-    assert_that(cluster_manager.sync_config).is_equal_to(sync_config)
+    cluster_manager = ClusterManager(sync_config)
+    cluster_manager.set_config(sync_config)
+    assert_that(cluster_manager._config).is_equal_to(sync_config)
     if initialize_instance_manager:
-        cluster_manager._initialize_instance_manager.assert_called_once()
+        assert_that(initialize_instance_manager_mock.call_count).is_equal_to(2)
     else:
-        cluster_manager._initialize_instance_manager.assert_not_called()
+        initialize_instance_manager_mock.assert_called_once()
+    assert_that(initialize_compute_fleet_status_manager_mock.call_count).is_equal_to(2)
 
 
 @pytest.mark.parametrize(
@@ -175,39 +178,36 @@ def test_get_node_info_from_partition(
 ):
     mocker.patch("slurm_plugin.clustermgtd.ClusterManager._get_partition_info_with_retry", return_value=partitions)
     mocker.patch("slurm_plugin.clustermgtd.ClusterManager._get_node_info_with_retry", side_effect=get_nodes_side_effect)
-    cluster_manager = ClusterManager()
-    active_nodes, inactive_nodes = cluster_manager._get_node_info_from_partition()
+    active_nodes, inactive_nodes = ClusterManager._get_node_info_from_partition()
     assert_that(active_nodes).is_equal_to(expected_active_nodes)
     assert_that(inactive_nodes).is_equal_to(expected_inactive_nodes)
 
 
+@pytest.mark.usefixtures("initialize_instance_manager_mock", "initialize_compute_fleet_status_manager_mock")
 def test_clean_up_inactive_parititon(mocker):
     # Test setup
     inactive_nodes = ["some inactive nodes"]
     mock_sync_config = SimpleNamespace(
         terminate_max_batch_size=4, region="us-east-2", cluster_name="hit-test", boto3_config="some config"
     )
-    cluster_manager = ClusterManager()
-    cluster_manager._set_sync_config(mock_sync_config)
-    cluster_manager._initialize_instance_manager()
-    cluster_manager.instance_manager.terminate_associated_instances = mocker.MagicMock()
+    cluster_manager = ClusterManager(mock_sync_config)
+    cluster_manager._instance_manager.terminate_associated_instances = mocker.MagicMock()
     cluster_manager._clean_up_inactive_partition(inactive_nodes)
-    cluster_manager.instance_manager.terminate_associated_instances.assert_called_with(
+    cluster_manager._instance_manager.terminate_associated_instances.assert_called_with(
         ["some inactive nodes"], terminate_batch_size=4
     )
 
 
+@pytest.mark.usefixtures("initialize_compute_fleet_status_manager_mock")
 def test_get_ec2_instances(mocker):
     # Test setup
     mock_sync_config = SimpleNamespace(region="us-east-2", cluster_name="hit-test", boto3_config="some config")
-    cluster_manager = ClusterManager()
-    cluster_manager._set_sync_config(mock_sync_config)
-    cluster_manager._initialize_instance_manager()
-    cluster_manager.instance_manager.get_cluster_instances = mocker.MagicMock()
+    cluster_manager = ClusterManager(mock_sync_config)
+    cluster_manager._instance_manager.get_cluster_instances = mocker.MagicMock()
     # Run test
     cluster_manager._get_ec2_instances()
     # Assert calls
-    cluster_manager.instance_manager.get_cluster_instances.assert_called_with(
+    cluster_manager._instance_manager.get_cluster_instances.assert_called_with(
         include_master=False, alive_states_only=True
     )
 
@@ -282,6 +282,7 @@ def test_get_ec2_instances(mocker):
     ],
     ids=["basic", "disable_ec2", "disable_all", "disable_scheduled", "no_unhealthy_instance"],
 )
+@pytest.mark.usefixtures("initialize_compute_fleet_status_manager_mock")
 def test_perform_health_check_actions(
     mock_instance_health_states,
     disable_ec2_health_check,
@@ -300,12 +301,11 @@ def test_perform_health_check_actions(
         region="us-east-2",
         cluster_name="hit-test",
         boto3_config="some config",
+        dynamodb_table="table_name",
     )
     # Mock functions
-    cluster_manager = ClusterManager()
-    cluster_manager._set_sync_config(mock_sync_config)
-    cluster_manager._initialize_instance_manager()
-    cluster_manager.instance_manager.get_unhealthy_cluster_instance_status = mocker.MagicMock(
+    cluster_manager = ClusterManager(mock_sync_config)
+    cluster_manager._instance_manager.get_unhealthy_cluster_instance_status = mocker.MagicMock(
         return_value=mock_instance_health_states
     )
     cluster_manager._handle_health_check = mocker.MagicMock().patch()
@@ -431,6 +431,7 @@ def test_fail_scheduled_events_health_check(instance_health_state, expected_resu
     ],
     ids=["scheduled_event", "ec2_health", "all_healthy"],
 )
+@pytest.mark.usefixtures("initialize_compute_fleet_status_manager_mock", "initialize_instance_manager_mock")
 def test_handle_health_check(
     health_check_type, mock_fail_ec2_side_effect, mock_fail_scheduled_events_side_effect, expected_failed_nodes, mocker
 ):
@@ -454,10 +455,9 @@ def test_handle_health_check(
         side_effect=mock_fail_scheduled_events_side_effect,
     )
     # Setup mocking
-    cluster_manager = ClusterManager()
-    cluster_manager._set_current_time("some_current_time")
     mock_sync_config = SimpleNamespace(health_check_timeout=10)
-    cluster_manager._set_sync_config(mock_sync_config, initialize_instance_manager=False)
+    cluster_manager = ClusterManager(mock_sync_config)
+    cluster_manager._current_time = "some_current_time"
     drain_node_mock = mocker.patch("slurm_plugin.clustermgtd.set_nodes_drain", autospec=True)
     # Run tests
     cluster_manager._handle_health_check(
@@ -496,11 +496,12 @@ def test_handle_health_check(
     ],
     ids=["mixed"],
 )
-def test_update_static_nodes_in_replacement(current_replacing_nodes, slurm_nodes, expected_replacing_nodes):
-    cluster_manager = ClusterManager()
-    cluster_manager._set_static_nodes_in_replacement(current_replacing_nodes)
+@pytest.mark.usefixtures("initialize_instance_manager_mock", "initialize_compute_fleet_status_manager_mock")
+def test_update_static_nodes_in_replacement(current_replacing_nodes, slurm_nodes, expected_replacing_nodes, mocker):
+    cluster_manager = ClusterManager(mocker.MagicMock())
+    cluster_manager._static_nodes_in_replacement = current_replacing_nodes
     cluster_manager._update_static_nodes_in_replacement(slurm_nodes)
-    assert_that(cluster_manager.static_nodes_in_replacement).is_equal_to(expected_replacing_nodes)
+    assert_that(cluster_manager._static_nodes_in_replacement).is_equal_to(expected_replacing_nodes)
 
 
 @pytest.mark.parametrize(
@@ -531,14 +532,14 @@ def test_update_static_nodes_in_replacement(current_replacing_nodes, slurm_nodes
     ],
     ids=["not_in_replacement", "no-backing-instance", "in_replacement", "timeout"],
 )
+@pytest.mark.usefixtures("initialize_instance_manager_mock", "initialize_compute_fleet_status_manager_mock")
 def test_is_node_being_replaced(
     current_replacing_nodes, node, private_ip_to_instance_map, current_time, expected_result
 ):
     mock_sync_config = SimpleNamespace(node_replacement_timeout=30)
-    cluster_manager = ClusterManager()
-    cluster_manager._set_sync_config(mock_sync_config, initialize_instance_manager=False)
-    cluster_manager._set_current_time(current_time)
-    cluster_manager._set_static_nodes_in_replacement(current_replacing_nodes)
+    cluster_manager = ClusterManager(mock_sync_config)
+    cluster_manager._current_time = current_time
+    cluster_manager._static_nodes_in_replacement = current_replacing_nodes
     assert_that(cluster_manager._is_node_being_replaced(node, private_ip_to_instance_map)).is_equal_to(expected_result)
 
 
@@ -628,9 +629,9 @@ def test_is_backing_instance_valid(node, instances_ips_in_cluster, expected_resu
         "down_not_term",
     ],
 )
+@pytest.mark.usefixtures("initialize_instance_manager_mock", "initialize_compute_fleet_status_manager_mock")
 def test_is_node_state_healthy(node, mock_sync_config, mock_is_node_being_replaced, expected_result, mocker):
-    cluster_manager = ClusterManager()
-    cluster_manager._set_sync_config(mock_sync_config, initialize_instance_manager=False)
+    cluster_manager = ClusterManager(mock_sync_config)
     cluster_manager._is_node_being_replaced = mocker.MagicMock(return_value=mock_is_node_being_replaced)
     assert_that(
         cluster_manager._is_node_state_healthy(node, private_ip_to_instance_map={"placeholder phonebook"})
@@ -688,10 +689,10 @@ def test_is_node_state_healthy(node, mock_sync_config, mock_is_node_being_replac
     ],
     ids=["basic", "static_nodeaddr_not_set", "dynamic_nodeaddr_not_set", "dynamic_unhealthy", "static_unhealthy"],
 )
+@pytest.mark.usefixtures("initialize_instance_manager_mock", "initialize_compute_fleet_status_manager_mock")
 def test_is_node_healthy(node, private_ip_to_instance_map, instance_ips_in_cluster, expected_result, mocker):
     mock_sync_config = SimpleNamespace(terminate_down_nodes=True)
-    cluster_manager = ClusterManager()
-    cluster_manager._set_sync_config(mock_sync_config, initialize_instance_manager=False)
+    cluster_manager = ClusterManager(mock_sync_config)
     assert_that(cluster_manager._is_node_healthy(node, private_ip_to_instance_map)).is_equal_to(expected_result)
 
 
@@ -759,6 +760,7 @@ def test_handle_unhealthy_dynamic_nodes(unhealthy_dynamic_nodes, expected_power_
     ],
     ids=["basic", "no_associated_instances"],
 )
+@pytest.mark.usefixtures("initialize_compute_fleet_status_manager_mock")
 def test_handle_unhealthy_static_nodes(
     current_replacing_nodes,
     unhealthy_static_nodes,
@@ -777,26 +779,24 @@ def test_handle_unhealthy_static_nodes(
         cluster_name="hit-test",
         boto3_config="some config",
     )
-    cluster_manager = ClusterManager()
-    cluster_manager._set_sync_config(mock_sync_config)
-    cluster_manager._initialize_instance_manager()
-    cluster_manager._set_static_nodes_in_replacement(current_replacing_nodes)
+    cluster_manager = ClusterManager(mock_sync_config)
+    cluster_manager._static_nodes_in_replacement = current_replacing_nodes
     # Mock associated function
-    cluster_manager.instance_manager.delete_instances = mocker.MagicMock()
-    cluster_manager.instance_manager.add_instances_for_nodes = mocker.MagicMock()
+    cluster_manager._instance_manager.delete_instances = mocker.MagicMock()
+    cluster_manager._instance_manager.add_instances_for_nodes = mocker.MagicMock()
     update_mock = mocker.patch("slurm_plugin.clustermgtd.set_nodes_down", return_value=None, autospec=True)
     # Run test
     cluster_manager._handle_unhealthy_static_nodes(unhealthy_static_nodes, private_ip_to_instance_map)
     # Assert calls
     update_mock.assert_called_with(add_node_list, reason="Static node maintenance: unhealthy node is being replaced")
     if delete_instance_list:
-        cluster_manager.instance_manager.delete_instances.assert_called_with(
+        cluster_manager._instance_manager.delete_instances.assert_called_with(
             delete_instance_list, terminate_batch_size=1
         )
     else:
-        cluster_manager.instance_manager.delete_instances.assert_not_called()
-    cluster_manager.instance_manager.add_instances_for_nodes.assert_called_with(add_node_list, 5, False)
-    assert_that(cluster_manager.static_nodes_in_replacement).is_equal_to(expected_replacing_nodes)
+        cluster_manager._instance_manager.delete_instances.assert_not_called()
+    cluster_manager._instance_manager.add_instances_for_nodes.assert_called_with(add_node_list, 5, False)
+    assert_that(cluster_manager._static_nodes_in_replacement).is_equal_to(expected_replacing_nodes)
 
 
 @pytest.mark.parametrize(
@@ -822,10 +822,11 @@ def test_handle_unhealthy_static_nodes(
     ],
     ids=["basic", "repetitive_ip"],
 )
+@pytest.mark.usefixtures("initialize_instance_manager_mock", "initialize_compute_fleet_status_manager_mock")
 def test_maintain_nodes(cluster_instances, active_nodes, mock_unhealthy_nodes, mocker):
     # Mock functions
     mock_private_ip_to_instance_map = {instance.private_ip: instance for instance in cluster_instances}
-    cluster_manager = ClusterManager()
+    cluster_manager = ClusterManager(mocker.MagicMock())
     cluster_manager._update_static_nodes_in_replacement = mocker.MagicMock()
     cluster_manager._find_unhealthy_slurm_nodes = mocker.MagicMock(return_value=mock_unhealthy_nodes)
     mock_handle_unhealthy_dynamic_nodes = mocker.patch(
@@ -876,11 +877,11 @@ def test_maintain_nodes(cluster_instances, active_nodes, mock_unhealthy_nodes, m
     ],
     ids=["all_good", "orphaned", "orphaned_timeout"],
 )
+@pytest.mark.usefixtures("initialize_compute_fleet_status_manager_mock")
 def test_terminate_orphaned_instances(
     cluster_instances, private_ip_to_instance_map, current_time, expected_instance_to_terminate, mocker
 ):
     # Mock functions
-    cluster_manager = ClusterManager()
     mock_sync_config = SimpleNamespace(
         orphaned_instance_timeout=30,
         terminate_max_batch_size=4,
@@ -888,15 +889,14 @@ def test_terminate_orphaned_instances(
         cluster_name="hit-test",
         boto3_config="some config",
     )
-    cluster_manager._set_sync_config(mock_sync_config)
-    cluster_manager._initialize_instance_manager()
-    cluster_manager._set_current_time(current_time)
-    cluster_manager.instance_manager.delete_instances = mocker.MagicMock()
+    cluster_manager = ClusterManager(mock_sync_config)
+    cluster_manager._current_time = current_time
+    cluster_manager._instance_manager.delete_instances = mocker.MagicMock()
     # Run test
     cluster_manager._terminate_orphaned_instances(cluster_instances, private_ip_to_instance_map)
     # Check function calls
     if expected_instance_to_terminate:
-        cluster_manager.instance_manager.delete_instances.assert_called_with(
+        cluster_manager._instance_manager.delete_instances.assert_called_with(
             expected_instance_to_terminate, terminate_batch_size=4
         )
 
@@ -965,7 +965,7 @@ def test_manage_cluster(
     )
     ip_to_slurm_node_map = {node.nodeaddr: node for node in mock_active_nodes}
     current_time = datetime(2020, 1, 1, 0, 0, 0)
-    cluster_manager = ClusterManager()
+    cluster_manager = ClusterManager(mock_sync_config)
     # Set up function mocks
     cluster_manager._initialize_instance_manager = mocker.MagicMock()
     cluster_manager._set_current_time = mocker.MagicMock(side_effect=cluster_manager._set_current_time(current_time))
@@ -1426,3 +1426,19 @@ def test_manage_cluster_boto3(
             return_value=(mocked_active_nodes, mocked_inactive_nodes),
         )
     cluster_manager.manage_cluster(sync_config)
+
+
+@pytest.fixture()
+def initialize_instance_manager_mock(mocker):
+    return mocker.patch.object(
+        ClusterManager, "_initialize_instance_manager", spec=ClusterManager._initialize_instance_manager
+    )
+
+
+@pytest.fixture()
+def initialize_compute_fleet_status_manager_mock(mocker):
+    return mocker.patch.object(
+        ClusterManager,
+        "_initialize_compute_fleet_status_manager",
+        spec=ClusterManager._initialize_compute_fleet_status_manager,
+    )

@@ -310,6 +310,15 @@ class InstanceManager:
             for instance_info in filtered_iterator
         ]
 
+    def terminate_all_compute_nodes(self, terminate_batch_size):
+        try:
+            compute_nodes = self.get_cluster_instances()
+            self.delete_instances([instance.id for instance in compute_nodes], terminate_batch_size)
+            return True
+        except Exception as e:
+            logging.error("Failed when terminating compute fleet with error %s", e)
+            return False
+
 
 def time_is_up(initial_time, current_time, grace_time):
     """Check if timeout is exceeded."""

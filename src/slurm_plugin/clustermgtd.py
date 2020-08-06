@@ -15,16 +15,20 @@ from datetime import datetime, timezone
 from enum import Enum
 from logging.config import fileConfig
 
+import boto3 as boto3
+from boto3.dynamodb.conditions import Attr
 from botocore.config import Config
 from configparser import ConfigParser
 from retrying import retry
 
 from common.schedulers.slurm_commands import (
+    PartitionState,
     get_nodes_info,
     get_partition_info,
     set_nodes_down,
     set_nodes_down_and_power_save,
     set_nodes_drain,
+    update_all_partitions,
 )
 from common.time_utils import seconds
 from common.utils import sleep_remaining_loop_time
@@ -39,6 +43,65 @@ from slurm_plugin.common import (
 
 LOOP_TIME = 30
 log = logging.getLogger(__name__)
+
+
+class ComputeFleetStatus(Enum):
+    STOPPED = "STOPPED"
+    RUNNING = "RUNNING"
+    STOPPING = "STOPPING"
+    STARTING = "STARTING"
+    STOP_REQUESTED = "STOP_REQUESTED"
+    START_REQUESTED = "START_REQUESTED"
+
+    @staticmethod
+    def is_stop_status(status):
+        return status in {ComputeFleetStatus.STOP_REQUESTED, ComputeFleetStatus.STOPPING, ComputeFleetStatus.STOPPED}
+
+    @staticmethod
+    def is_start_in_progress(status):
+        return status in {ComputeFleetStatus.START_REQUESTED, ComputeFleetStatus.STARTING}
+
+    @staticmethod
+    def is_stop_in_progress(status):
+        return status in {ComputeFleetStatus.STOP_REQUESTED, ComputeFleetStatus.STOPPING}
+
+
+class ComputeFleetStatusManager:
+    COMPUTE_FLEET_STATUS_KEY = "COMPUTE_FLEET"
+    COMPUTE_FLEET_STATUS_ATTRIBUTE = "Status"
+
+    class ConditionalStatusUpdateFailed(Exception):
+        pass
+
+    def __init__(self, table_name, boto3_config, region):
+        self._table_name = table_name
+        self._boto3_config = boto3_config
+        self.__region = region
+        self._ddb_resource = boto3.resource("dynamodb", region_name=region, config=boto3_config)
+        self._table = self._ddb_resource.Table(table_name)
+
+    def get_status(self, fallback=None):
+        try:
+            compute_fleet_status = self._table.get_item(
+                ConsistentRead=True, Key={"Id": {"S": self.COMPUTE_FLEET_STATUS_KEY}}
+            )
+            if not compute_fleet_status:
+                raise Exception("COMPUTE_FLEET status not found in db table")
+            return ComputeFleetStatus(compute_fleet_status["Item"][self.COMPUTE_FLEET_STATUS_ATTRIBUTE]["S"])
+        except Exception as e:
+            log.error(
+                "Failed when retrieving fleet status from DynamoDB with error %s, using fallback value %s", e, fallback
+            )
+            return fallback
+
+    def update_status(self, current_status, next_status):
+        try:
+            self._table.put_item(
+                Item={"Id": self.COMPUTE_FLEET_STATUS_KEY, self.COMPUTE_FLEET_STATUS_ATTRIBUTE: str(next_status)},
+                ConditionExpression=Attr(self.COMPUTE_FLEET_STATUS_ATTRIBUTE).eq(str(current_status)),
+            )
+        except self._ddb_resource.meta.client.exceptions.ConditionalCheckFailedException as e:
+            raise ComputeFleetStatusManager.ConditionalStatusUpdateFailed(e)
 
 
 class ClustermgtdConfig:
@@ -78,6 +141,8 @@ class ClustermgtdConfig:
         """Get basic config options."""
         self.region = config.get("clustermgtd", "region")
         self.cluster_name = config.get("clustermgtd", "cluster_name")
+        self.dynamodb_table = config.get("clustermgtd", "dynamodb_table")
+
         # Configure boto3 to retry 5 times by default
         self._boto3_config = {"retries": {"max_attempts": self.DEFAULTS.get("max_retry"), "mode": "standard"}}
         self.loop_time = config.getint("clustermgtd", "loop_time", fallback=self.DEFAULTS.get("loop_time"))
@@ -178,40 +243,80 @@ class ClusterManager:
 
         pass
 
-    def __init__(self):
+    def __init__(self, config):
         """
         Initialize ClusterManager.
 
         self.static_nodes_in_replacement is persistent across multiple iteration of manage_cluster
         This state is required because we need to ignore static nodes that might have long bootstrap time
         """
-        self.static_nodes_in_replacement = set()
+        self._static_nodes_in_replacement = set()
+        self._compute_fleet_status = None
+        self._current_time = None
+        self._config = config
+        self._instance_manager = self._initialize_instance_manager(config)
+        self._compute_fleet_status_manager = self._initialize_compute_fleet_status_manager(config)
 
-    def _set_static_nodes_in_replacement(self, node_list):
-        """Setter function used for testing purposes only; not used in production."""
-        self.static_nodes_in_replacement = set(node_list)
-
-    def _set_current_time(self, current_time):
-        self.current_time = current_time
-
-    def _set_sync_config(self, sync_config, initialize_instance_manager=True):
-        self.sync_config = sync_config
+    def set_config(self, config, initialize_instance_manager=True):
+        self._config = config
+        self._compute_fleet_status_manager = self._initialize_compute_fleet_status_manager(config)
         if initialize_instance_manager:
-            self._initialize_instance_manager()
+            self._instance_manager = self._initialize_instance_manager(config)
 
-    def _initialize_instance_manager(self):
+    @staticmethod
+    def _initialize_instance_manager(config):
         """Initialize instance manager class that will be used to launch/terminate/describe instances."""
-        self.instance_manager = InstanceManager(
-            self.sync_config.region, self.sync_config.cluster_name, self.sync_config.boto3_config
+        return InstanceManager(config.region, config.cluster_name, config.boto3_config)
+
+    @staticmethod
+    def _initialize_compute_fleet_status_manager(config):
+        return ComputeFleetStatusManager(
+            table_name=config.dynamodb_table, boto3_config=config.boto3_config, region=config.region
         )
 
-    def manage_cluster(self, sync_config):
+    def _update_compute_fleet_status(self, status):
+        self._compute_fleet_status_manager.update_status(current_status=self._compute_fleet_status, next_status=status)
+        self._compute_fleet_status = status
+
+    @log_exception(log, "handling compute fleet status transitions", catch_exception=Exception, raise_on_error=False)
+    def manage_compute_fleet_status_transitions(self):
+        self._compute_fleet_status = self._compute_fleet_status_manager.get_status(fallback=self._compute_fleet_status)
+        logging.info("Current compute fleet status: %s", self._compute_fleet_status)
+        try:
+            if ComputeFleetStatus.is_stop_status(self._compute_fleet_status):
+                # Since Slurm partition status might have been modified, when STOPPED we want to keep checking
+                # partitions and EC2 instances
+                if self._compute_fleet_status == ComputeFleetStatus.STOP_REQUESTED:
+                    self._update_compute_fleet_status(ComputeFleetStatus.STOPPING)
+                partitions_deactivated_successfully = update_all_partitions(PartitionState.INACTIVE)
+                nodes_terminated = self._instance_manager.terminate_all_compute_nodes(
+                    self._config.terminate_max_batch_size
+                )
+                if partitions_deactivated_successfully and nodes_terminated:
+                    if self._compute_fleet_status == ComputeFleetStatus.STOPPING:
+                        self._update_compute_fleet_status(ComputeFleetStatus.STOPPED)
+            elif ComputeFleetStatus.requires_start(self._compute_fleet_status):
+                if self._compute_fleet_status == ComputeFleetStatus.START_REQUESTED:
+                    self._update_compute_fleet_status(ComputeFleetStatus.STARTING)
+                partitions_activated_successfully = update_all_partitions(PartitionState.UP)
+                if partitions_activated_successfully:
+                    self._update_compute_fleet_status(ComputeFleetStatus.RUNNING)
+        except ComputeFleetStatusManager.ConditionalStatusUpdateFailed:
+            log.warning(
+                "Cluster status was updated while handling a transition from %s. Restarting the status transition",
+                self._compute_fleet_status,
+            )
+            self.manage_compute_fleet_status_transitions()
+
+    def manage_cluster(self):
         """Manage cluster by syncing scheduler states with EC2 states and performing node maintenance actions."""
         # Initialization
         log.info("Managing cluster...")
-        self._set_sync_config(sync_config)
-        self._set_current_time(datetime.now(tz=timezone.utc))
-        if not sync_config.disable_all_cluster_management:
+        self._current_time = datetime.now(tz=timezone.utc)
+
+        self.manage_compute_fleet_status_transitions()
+
+        if not self._config.disable_all_cluster_management and self._compute_fleet_status == ComputeFleetStatus.RUNNING:
             # Get node states for nodes in inactive and active partitions
             try:
                 active_nodes, inactive_nodes = ClusterManager._get_node_info_from_partition()
@@ -235,7 +340,7 @@ class ClusterManager:
             # Clean up orphaned instances and skip all other operations if no active node
             if active_nodes:
                 # Perform health check actions
-                if not sync_config.disable_all_health_checks:
+                if not self._config.disable_all_health_checks:
                     self._perform_health_check_actions(cluster_instances, ip_to_slurm_node_map)
                 # Maintain slurm nodes
                 self._maintain_nodes(cluster_instances, active_nodes)
@@ -246,7 +351,7 @@ class ClusterManager:
 
     def _write_timestamp_to_file(self):
         """Write timestamp into shared file so compute nodes can determine if head node is online."""
-        with open(self.sync_config.heartbeat_file_path, "w") as timestamp_file:
+        with open(self._config.heartbeat_file_path, "w") as timestamp_file:
             # Note: heartbeat must be written with datetime.strftime to convert localized datetime into str
             # datetime.strptime will not work with str(datetime)
             timestamp_file.write(datetime.now(tz=timezone.utc).strftime(TIMESTAMP_FORMAT))
@@ -295,8 +400,8 @@ class ClusterManager:
         describe_instances call is made with filter on private IPs
         """
         log.info("Clean up instances associated with nodes in INACTIVE partitions: %s", inactive_nodes)
-        self.instance_manager.terminate_associated_instances(
-            inactive_nodes, terminate_batch_size=self.sync_config.terminate_max_batch_size
+        self._instance_manager.terminate_associated_instances(
+            inactive_nodes, terminate_batch_size=self._config.terminate_max_batch_size
         )
 
     def _get_ec2_instances(self):
@@ -307,7 +412,7 @@ class ClusterManager:
         Instances returned will not contain instances previously terminated in _clean_up_inactive_partition
         """
         try:
-            return self.instance_manager.get_cluster_instances(include_master=False, alive_states_only=True)
+            return self._instance_manager.get_cluster_instances(include_master=False, alive_states_only=True)
         except Exception as e:
             log.error("Failed when getting instance info from EC2 with exception %s" % e)
             raise ClusterManager.EC2InstancesInfoUnavailable
@@ -318,13 +423,13 @@ class ClusterManager:
         log.info("Performing instance health check actions")
         id_to_instance_map = {instance.id: instance for instance in cluster_instances}
         # Get health states for instances that might be considered unhealthy
-        unhealthy_instance_status = self.instance_manager.get_unhealthy_cluster_instance_status(
+        unhealthy_instance_status = self._instance_manager.get_unhealthy_cluster_instance_status(
             list(id_to_instance_map.keys())
         )
         log.debug("Cluster instances that might be considered unhealthy: %s", unhealthy_instance_status)
         if unhealthy_instance_status:
             # Perform EC2 health check actions
-            if not self.sync_config.disable_ec2_health_check:
+            if not self._config.disable_ec2_health_check:
                 self._handle_health_check(
                     unhealthy_instance_status,
                     id_to_instance_map,
@@ -332,7 +437,7 @@ class ClusterManager:
                     health_check_type=ClusterManager.HealthCheckTypes.ec2_health,
                 )
             # Perform scheduled event actions
-            if not self.sync_config.disable_scheduled_event_health_check:
+            if not self._config.disable_scheduled_event_health_check:
                 self._handle_health_check(
                     unhealthy_instance_status,
                     id_to_instance_map,
@@ -392,8 +497,8 @@ class ClusterManager:
             ClusterManager.HealthCheckTypes.ec2_health: {
                 "function": ClusterManager._fail_ec2_health_check,
                 "default_kwargs": {
-                    "current_time": self.current_time,
-                    "health_check_timeout": self.sync_config.health_check_timeout,
+                    "current_time": self._current_time,
+                    "health_check_timeout": self._config.health_check_timeout,
                 },
             },
         }
@@ -423,12 +528,12 @@ class ClusterManager:
         """Update self.static_nodes_in_replacement by removing nodes that finished replacement and is up."""
         nodename_to_slurm_nodes_map = {node.name: node for node in slurm_nodes}
         nodes_still_in_replacement = set()
-        for nodename in self.static_nodes_in_replacement:
+        for nodename in self._static_nodes_in_replacement:
             node = nodename_to_slurm_nodes_map.get(nodename)
             # Remove nodename from static_nodes_in_replacement if node is no longer an active node or node is up
             if node and not node.is_up():
                 nodes_still_in_replacement.add(nodename)
-        self.static_nodes_in_replacement = nodes_still_in_replacement
+        self._static_nodes_in_replacement = nodes_still_in_replacement
 
     def _find_unhealthy_slurm_nodes(self, slurm_nodes, private_ip_to_instance_map):
         """Check and return slurm nodes with unhealthy scheduler state, grouping by node type (static/dynamic)."""
@@ -448,9 +553,9 @@ class ClusterManager:
         backing_instance = private_ip_to_instance_map.get(node.nodeaddr)
         if (
             backing_instance
-            and node.name in self.static_nodes_in_replacement
+            and node.name in self._static_nodes_in_replacement
             and not time_is_up(
-                backing_instance.launch_time, self.current_time, grace_time=self.sync_config.node_replacement_timeout
+                backing_instance.launch_time, self._current_time, grace_time=self._config.node_replacement_timeout
             )
         ):
             return True
@@ -476,7 +581,7 @@ class ClusterManager:
     def _is_node_state_healthy(self, node, private_ip_to_instance_map):
         """Check if a slurm node's scheduler state is considered healthy."""
         # Check to see if node is in DRAINED, ignoring any node currently being replaced
-        if node.is_drained() and self.sync_config.terminate_drain_nodes:
+        if node.is_drained() and self._config.terminate_drain_nodes:
             if self._is_node_being_replaced(node, private_ip_to_instance_map):
                 log.info("Node state check: node %s in DRAINED but is currently being replaced, ignoring", node)
                 return True
@@ -484,7 +589,7 @@ class ClusterManager:
                 log.warning("Node state check: node %s in DRAINED, replacing node", node)
                 return False
         # Check to see if node is in DOWN, ignoring any node currently being replaced
-        if node.is_down() and self.sync_config.terminate_down_nodes:
+        if node.is_down() and self._config.terminate_down_nodes:
             if self._is_node_being_replaced(node, private_ip_to_instance_map):
                 log.info("Node state check: node %s in DOWN but is currently being replaced, ignoring.", node)
                 return True
@@ -549,17 +654,18 @@ class ClusterManager:
                 instances_to_terminate,
                 unhealthy_static_nodes,
             )
-            self.instance_manager.delete_instances(
-                instances_to_terminate, terminate_batch_size=self.sync_config.terminate_max_batch_size
+            self._instance_manager.delete_instances(
+                instances_to_terminate, terminate_batch_size=self._config.terminate_max_batch_size
             )
         log.info("Launching new instances for unhealthy static nodes: %s", unhealthy_static_nodes)
-        self.instance_manager.add_instances_for_nodes(
-            node_list, self.sync_config.launch_max_batch_size, self.sync_config.update_node_address
+        self._instance_manager.add_instances_for_nodes(
+            node_list, self._config.launch_max_batch_size, self._config.update_node_address
         )
         # Add node to list of nodes being replaced
-        self.static_nodes_in_replacement |= set(node_list)
+        self._static_nodes_in_replacement |= set(node_list)
         log.info(
-            "After node maintenance, following nodes are currently in replacement: %s", self.static_nodes_in_replacement
+            "After node maintenance, following nodes are currently in replacement: %s",
+            self._static_nodes_in_replacement,
         )
 
     @log_exception(log, "maintaining slurm nodes", catch_exception=Exception, raise_on_error=False)
@@ -573,7 +679,7 @@ class ClusterManager:
         log.info("Performing node maintenance actions")
         # Update self.static_nodes_in_replacement by removing any up nodes from the set
         self._update_static_nodes_in_replacement(slurm_nodes)
-        log.info("Following nodes are currently in replacement: %s", self.static_nodes_in_replacement)
+        log.info("Following nodes are currently in replacement: %s", self._static_nodes_in_replacement)
         private_ip_to_instance_map = {instance.private_ip: instance for instance in cluster_instances}
         unhealthy_dynamic_nodes, unhealthy_static_nodes = self._find_unhealthy_slurm_nodes(
             slurm_nodes, private_ip_to_instance_map
@@ -596,36 +702,38 @@ class ClusterManager:
         instances_to_terminate = []
         for instance in cluster_instances:
             if instance.private_ip not in ips_used_by_slurm and time_is_up(
-                instance.launch_time, self.current_time, self.sync_config.orphaned_instance_timeout
+                instance.launch_time, self._current_time, self._config.orphaned_instance_timeout
             ):
                 instances_to_terminate.append(instance.id)
         if instances_to_terminate:
             log.info("Terminating the following orphaned instances: %s", instances_to_terminate)
-            self.instance_manager.delete_instances(
-                instances_to_terminate, terminate_batch_size=self.sync_config.terminate_max_batch_size
+            self._instance_manager.delete_instances(
+                instances_to_terminate, terminate_batch_size=self._config.terminate_max_batch_size
             )
 
 
 def _run_clustermgtd():
     """Run clustermgtd actions."""
-    cluster_manager = ClusterManager()
+    config = ClustermgtdConfig(os.path.join(CONFIG_FILE_DIR, "parallelcluster_clustermgtd.conf"))
+    cluster_manager = ClusterManager(config=config)
     while True:
         # Get loop start time
         start_time = datetime.now(tz=timezone.utc)
         # Get program config
-        sync_config = ClustermgtdConfig(os.path.join(CONFIG_FILE_DIR, "parallelcluster_clustermgtd.conf"))
+        config = ClustermgtdConfig(os.path.join(CONFIG_FILE_DIR, "parallelcluster_clustermgtd.conf"))
+        cluster_manager.set_config(config)
         # Configure root logger
         try:
-            fileConfig(sync_config.logging_config, disable_existing_loggers=False)
+            fileConfig(config.logging_config, disable_existing_loggers=False)
         except Exception as e:
             log.warning(
                 "Unable to configure logging from %s, using default logging settings.\nException: %s",
-                sync_config.logging_config,
+                config.logging_config,
                 e,
             )
         # Manage cluster
-        cluster_manager.manage_cluster(sync_config)
-        sleep_remaining_loop_time(sync_config.loop_time, start_time)
+        cluster_manager.manage_cluster()
+        sleep_remaining_loop_time(config.loop_time, start_time)
 
 
 @retry(wait_fixed=seconds(LOOP_TIME))
