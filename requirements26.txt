@@ -1,4 +1,4 @@
 pycparser==2.18
 idna==2.6
-paramiko==2.3.3
+paramiko==2.7.2
 cryptography==2.1.4
