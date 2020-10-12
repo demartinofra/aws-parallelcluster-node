@@ -29,6 +29,7 @@ class SlurmResumeConfig:
         "max_retry": 1,
         "max_batch_size": 500,
         "update_node_address": True,
+        "all_or_nothing_scaling": False,
         "proxy": "NONE",
         "logging_config": os.path.join(os.path.dirname(__file__), "logging", "parallelcluster_resume_logging.conf"),
         "hosted_zone": None,
@@ -70,6 +71,9 @@ class SlurmResumeConfig:
         )
         self.update_node_address = config.getboolean(
             "slurm_resume", "update_node_address", fallback=self.DEFAULTS.get("update_node_address")
+        )
+        self.all_or_nothing_scaling = config.getboolean(
+            "slurm_resume", "all_or_nothing_scaling", fallback=self.DEFAULTS.get("all_or_nothing_scaling")
         )
         instance_name_type_mapping_file = config.get(
             "slurm_resume", "instance_type_mapping", fallback=self.DEFAULTS.get("instance_type_mapping")
@@ -127,7 +131,9 @@ def _resume(arg_nodes, resume_config):
         master_hostname=resume_config.master_hostname,
         instance_name_type_mapping=resume_config.instance_name_type_mapping,
     )
-    instance_manager.add_instances_for_nodes(node_list, resume_config.max_batch_size, resume_config.update_node_address)
+    instance_manager.add_instances_for_nodes(
+        node_list, resume_config.max_batch_size, resume_config.update_node_address, resume_config.all_or_nothing_scaling
+    )
     success_nodes = [node for node in node_list if node not in instance_manager.failed_nodes]
     log.info("Successfully launched nodes %s", print_with_count(success_nodes))
     if instance_manager.failed_nodes:

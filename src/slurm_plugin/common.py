@@ -127,7 +127,9 @@ class InstanceManager:
         """Clear and reset failed nodes list."""
         self.failed_nodes = []
 
-    def add_instances_for_nodes(self, node_list, launch_batch_size, update_node_address=True):
+    def add_instances_for_nodes(
+        self, node_list, launch_batch_size, update_node_address=True, all_or_nothing_scaling=False
+    ):
         """Launch requested EC2 instances for nodes."""
         # Reset failed_nodes
         self._clear_failed_nodes()
@@ -137,7 +139,9 @@ class InstanceManager:
                 logger.info("Launching instances for slurm nodes %s", print_with_count(slurm_node_list))
                 for batch_nodes in grouper(slurm_node_list, launch_batch_size):
                     try:
-                        launched_instances = self._launch_ec2_instances(queue, instance_type, len(batch_nodes))
+                        launched_instances = self._launch_ec2_instances(
+                            queue, instance_type, len(batch_nodes), best_effort=not all_or_nothing_scaling
+                        )
                         if update_node_address:
                             assigned_nodes = self._update_slurm_node_addrs(list(batch_nodes), launched_instances)
                             try:
