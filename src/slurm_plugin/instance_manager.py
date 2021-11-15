@@ -11,6 +11,8 @@
 import collections
 import logging
 import subprocess
+import time
+from itertools import chain
 
 import boto3
 from botocore.config import Config
@@ -266,17 +268,77 @@ class InstanceManager:
                 logger.info(
                     "Found RunInstances parameters override. Launching instances with: %s", run_instances_params
                 )
-            result = ec2_client.run_instances(**run_instances_params)
+            # result = ec2_client.run_instances(**run_instances_params)
+            overrides = []
+            queue_config = self._instance_name_type_mapping[queue]
+            for subnet_id in queue_config["SubnetIds"]:
+                if queue_config["ComputeResources"][compute_resource].get("InstanceRequirements"):
+                    overrides.append(
+                        {
+                            "InstanceRequirements": queue_config["ComputeResources"][compute_resource][
+                                "InstanceRequirements"
+                            ],
+                            "SubnetId": subnet_id,
+                        }
+                    )
+                else:
+                    for instance_type in queue_config["ComputeResources"][compute_resource]["InstanceTypes"]:
+                        overrides.append(
+                            {
+                                "InstanceType": instance_type,
+                                "SubnetId": subnet_id,
+                            }
+                        )
+            logger.info("EC2 Fleet overrides: %s", overrides)
+            result = ec2_client.create_fleet(
+                LaunchTemplateConfigs=[
+                    {
+                        "LaunchTemplateSpecification": {
+                            "LaunchTemplateName": f"{self._cluster_name}-{queue}-{compute_resource}",
+                            "Version": "$Latest",
+                        },
+                        "Overrides": overrides,
+                    }
+                ],
+                TargetCapacitySpecification={
+                    "TotalTargetCapacity": current_batch_size,
+                    "DefaultTargetCapacityType": "on-demand" if queue_config["CapacityType"] == "ONDEMAND" else "spot",
+                },
+                Type="instant",
+                SpotOptions={
+                    "AllocationStrategy": queue_config["AllocationStrategy"],
+                    "SingleInstanceType": False,
+                    "SingleAvailabilityZone": False,
+                },
+                OnDemandOptions={
+                    "AllocationStrategy": queue_config["AllocationStrategy"],
+                    "CapacityReservationOptions": {"UsageStrategy": "use-capacity-reservations-first"},
+                    "SingleInstanceType": False,
+                    "SingleAvailabilityZone": False,
+                },
+            )
+            logger.info("FLEET RESULT: %s", result)
+            # Wait for instances to be available in EC2
+            time.sleep(5)
+            instances = [id for instances in result["Instances"] for id in instances["InstanceIds"]]
 
-            return [
-                EC2Instance(
-                    instance_info["InstanceId"],
-                    instance_info["PrivateIpAddress"],
-                    instance_info["PrivateDnsName"].split(".")[0],
-                    instance_info["LaunchTime"],
-                )
-                for instance_info in result["Instances"]
-            ]
+            if instances:
+                paginator = ec2_client.get_paginator("describe_instances")
+                response_iterator = paginator.paginate(InstanceIds=instances)
+                filtered_iterator = response_iterator.search("Reservations[].Instances[]")
+                instances = [
+                    EC2Instance(
+                        instance_info["InstanceId"],
+                        instance_info["PrivateIpAddress"],
+                        instance_info["PrivateDnsName"].split(".")[0],
+                        instance_info["LaunchTime"],
+                    )
+                    for instance_info in filtered_iterator
+                ]
+                logging.info("Launched instances: %s", instances)
+                return instances
+            else:
+                return []
         except ClientError as e:
             logger.error("Failed RunInstances request: %s", e.response.get("ResponseMetadata").get("RequestId"))
             raise
